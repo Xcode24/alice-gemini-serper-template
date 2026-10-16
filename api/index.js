@@ -2,9 +2,9 @@ const DEFAULT_MODEL = "gemini-3.5-flash-lite";
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
-const TOTAL_RESPONSE_BUDGET_MS = 3600;
+const TOTAL_RESPONSE_BUDGET_MS = 3900;
 const SERPER_TIMEOUT_MS = 600;
-const GEMINI_TIMEOUT_MS = 2500;
+const GEMINI_TIMEOUT_MS = 3000;
 
 const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
@@ -128,7 +128,12 @@ async function askGemini(text, history, searchContext, timeoutMs) {
     : text;
   contents.push({ role: "user", parts: [{ text: prompt }] });
 
-  const { response, data } = await fetchJson(
+  // Thinking is slow and Alice waits only ~4.5 s, so keep it minimal by default.
+  // Set GEMINI_THINKING_LEVEL=off in Vercel to stop sending this setting at all.
+  const thinkingLevel = String(process.env.GEMINI_THINKING_LEVEL ?? "minimal").trim().toLowerCase();
+  const useThinking = ["minimal", "low", "medium", "high"].includes(thinkingLevel);
+
+  const send = (withThinking, limitMs) => fetchJson(
     `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
     {
       method: "POST",
@@ -141,12 +146,24 @@ async function askGemini(text, history, searchContext, timeoutMs) {
         contents,
         generationConfig: {
           temperature: 0.5,
-          maxOutputTokens: 240
+          maxOutputTokens: 240,
+          ...(withThinking ? { thinkingConfig: { thinkingLevel } } : {})
         }
       })
     },
-    Math.min(GEMINI_TIMEOUT_MS, timeoutMs)
+    limitMs
   );
+
+  const startedAt = Date.now();
+  let { response, data } = await send(useThinking, Math.min(GEMINI_TIMEOUT_MS, timeoutMs));
+
+  // If this model rejects the thinking setting (HTTP 400), retry once without it.
+  if (useThinking && response.status === 400) {
+    console.warn("Gemini rejected the thinking setting; retrying without it.");
+    const left = Math.min(GEMINI_TIMEOUT_MS, timeoutMs) - (Date.now() - startedAt);
+    if (left < 400) throw new Error("TIME_BUDGET_EXHAUSTED");
+    ({ response, data } = await send(false, left));
+  }
 
   if (!response.ok) {
     const status = Number(response.status);
